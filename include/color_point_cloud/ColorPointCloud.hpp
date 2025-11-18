@@ -12,6 +12,7 @@
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 
 #include <tf2_ros/transform_broadcaster.h>
@@ -47,11 +48,14 @@ namespace color_point_cloud {
 
         std::vector<std::string> camera_topics_;
 
+        bool use_compressed_image_;
+
         std::map<std::string, CameraTypePtr> camera_type_stdmap_;
 
         std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subscribers_;
+        std::vector<rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr> compressed_image_subscribers_;
         std::vector<rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr> camera_info_subscribers_;
-
+                                                                                          
         void timer_callback();
 
         void point_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);

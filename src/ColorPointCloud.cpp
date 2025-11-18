@@ -32,6 +32,9 @@ namespace color_point_cloud {
             this->declare_parameter<std::string>("camera_info_topic_last_name", "/camera_info");
             camera_info_topic_last_name_ = this->get_parameter("camera_info_topic_last_name").as_string();
 
+            this->declare_parameter<bool>("use_compressed_image", false);
+            use_compressed_image_ = this->get_parameter("use_compressed_image").as_bool();
+
             // camera_topics
             this->declare_parameter<std::vector<std::string>>("camera_topics", std::vector<std::string>());
             camera_topics_ = this->get_parameter("camera_topics").as_string_array();
@@ -50,12 +53,37 @@ namespace color_point_cloud {
                 CameraTypePtr camera_type_ptr = std::make_shared<CameraType>(image_topic, camera_info_topic);
                 camera_type_stdmap_[camera_topic] = camera_type_ptr;
 
-                this->image_subscribers_.push_back(this->create_subscription<sensor_msgs::msg::Image>(
-                        image_topic, rclcpp::SensorDataQoS(),
-                        [this, image_topic, camera_topic](const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
-                            // RCLCPP_INFO(this->get_logger(), "Received image on topic %s", camera_topic.c_str());
-                            camera_type_stdmap_[camera_topic]->set_image_msg(msg);
-                        }));
+                if (use_compressed_image_) {
+                    this->compressed_image_subscribers_.push_back(
+                            this->create_subscription<sensor_msgs::msg::CompressedImage>(
+                                    image_topic, rclcpp::SensorDataQoS(),
+                                    [this, image_topic, camera_topic](
+                                            const sensor_msgs::msg::CompressedImage::ConstSharedPtr &msg) {
+                                        // RCLCPP_INFO(this->get_logger(), "Received compressed image on topic %s", camera_topic.c_str());
+                                        try {
+                                            cv::Mat image = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
+                                            if (image.empty()) {
+                                                RCLCPP_ERROR(this->get_logger(), "Failed to decode compressed image on topic %s", camera_topic.c_str());
+                                                return;
+                                            }
+                                            cv_bridge::CvImage cv_image;
+                                            cv_image.header = msg->header;
+                                            cv_image.encoding = sensor_msgs::image_encodings::BGR8;
+                                            cv_image.image = image;
+                                            auto image_msg = cv_image.toImageMsg();
+                                            camera_type_stdmap_[camera_topic]->set_image_msg(image_msg);
+                                        } catch (cv::Exception &e) {
+                                            RCLCPP_ERROR(this->get_logger(), "OpenCV exception on topic %s: %s", camera_topic.c_str(), e.what());
+                                        }
+                                    }));
+                } else {
+                    this->image_subscribers_.push_back(this->create_subscription<sensor_msgs::msg::Image>(
+                            image_topic, rclcpp::SensorDataQoS(),
+                            [this, image_topic, camera_topic](const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
+                                // RCLCPP_INFO(this->get_logger(), "Received image on topic %s", camera_topic.c_str());
+                                camera_type_stdmap_[camera_topic]->set_image_msg(msg);
+                            }));
+                }
 
                 this->camera_info_subscribers_.push_back(this->create_subscription<sensor_msgs::msg::CameraInfo>(
                         camera_info_topic, rclcpp::SensorDataQoS(), [this, camera_info_topic, camera_topic](
@@ -79,13 +107,14 @@ namespace color_point_cloud {
         {
             const auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::duration<double>(timeout_sec_));
-            timer_ = rclcpp::create_timer(this, this->get_clock(), period_ns,
-                                          std::bind(&ColorPointCloud::timer_callback, this));
+            timer_ = this->create_wall_timer(period_ns,
+                                             std::bind(&ColorPointCloud::timer_callback, this));
         }
 
     }
 
     void ColorPointCloud::timer_callback() {
+        //RCLCPP_INFO(this->get_logger(), "Timer callback triggered");
         for (const auto &pair: camera_type_stdmap_) {
             if (pair.second->get_image_msg() == nullptr || pair.second->get_camera_info() == nullptr) {
 //                RCLCPP_INFO(this->get_logger(), "Image or camera info is null for topic: %s", pair.first.c_str());
@@ -93,8 +122,14 @@ namespace color_point_cloud {
             }
 
             if (!pair.second->is_info_initialized()) {
+                auto cam_info = pair.second->get_camera_info();
                 RCLCPP_INFO(this->get_logger(), "Camera info is setting: %s", pair.first.c_str());
-                pair.second->set_camera_utils(pair.second->get_camera_info());
+                RCLCPP_INFO(this->get_logger(), "Camera info - width: %d, height: %d, K[0]: %f, frame_id: %s", 
+                    cam_info->width, cam_info->height, cam_info->k[0], cam_info->header.frame_id.c_str());
+                pair.second->set_camera_utils(cam_info);
+                if (!pair.second->is_info_initialized()) {
+                    RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera utils for: %s", pair.first.c_str());
+                }
             }
 
             if (!pair.second->is_transform_initialized() && pair.second->is_info_initialized()) {
@@ -114,22 +149,48 @@ namespace color_point_cloud {
         sensor_msgs::msg::PointCloud2 cloud_color_msg;
         std::for_each(camera_type_stdmap_.begin(), camera_type_stdmap_.end(),
                       [this, &cloud_color_msg, msg](std::pair<std::string, CameraTypePtr> pair) {
-                          if (pair.second->get_image_msg() == nullptr || pair.second->get_camera_info() == nullptr ||
-                              !pair.second->is_info_initialized() || !pair.second->is_transform_initialized()) {
-                              RCLCPP_INFO(this->get_logger(),
-                                          "Cant project camera: %s \n\n Expected reasons: \n don't receive image \n don't receive \n can't get transforme \n can't init camera utils",
-                                          pair.first.c_str());
+                          if (pair.second->get_image_msg() == nullptr) {
+                              RCLCPP_WARN(this->get_logger(), "Camera %s: don't receive image", pair.first.c_str());
                               return;
                           }
+                          if (pair.second->get_camera_info() == nullptr) {
+                              RCLCPP_WARN(this->get_logger(), "Camera %s: don't receive camera_info", pair.first.c_str());
+                              return;
+                          }
+                        //   if (!pair.second->is_info_initialized()) {
+                        //       RCLCPP_WARN(this->get_logger(), "Camera %s: can't init camera utils", pair.first.c_str());
+                        //       return;
+                        //   }
+                          if (!pair.second->is_transform_initialized()) {
+                              RCLCPP_WARN(this->get_logger(), "Camera %s: can't get transform", pair.first.c_str());
+                              return;
+                          }
+                          RCLCPP_INFO(this->get_logger(), "AAAAA");
+
                           pair.second->set_cv_image(pair.second->get_image_msg(), image_type_);
 
+                          // Check if input has ring and intensity fields
+                          bool has_ring = false;
+                          bool has_intensity = false;
+                          for (const auto& field : msg->fields) {
+                              if (field.name == "ring") has_ring = true;
+                              if (field.name == "intensity") has_intensity = true;
+                          }
+
                           sensor_msgs::PointCloud2Modifier modifier(cloud_color_msg);
-                          modifier.setPointCloud2Fields(6, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1,
-                                                        sensor_msgs::msg::PointField::FLOAT32, "z", 1,
-                                                        sensor_msgs::msg::PointField::FLOAT32, "rgb", 1,
-                                                        sensor_msgs::msg::PointField::FLOAT32, "ring", 1,
-                                                        sensor_msgs::msg::PointField::UINT16, "intensity", 1,
-                                                        sensor_msgs::msg::PointField::FLOAT32);
+                          if (has_ring && has_intensity) {
+                              modifier.setPointCloud2Fields(6, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32, "z", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32, "rgb", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32, "ring", 1,
+                                                            sensor_msgs::msg::PointField::UINT16, "intensity", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32);
+                          } else {
+                              modifier.setPointCloud2Fields(4, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32, "z", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32, "rgb", 1,
+                                                            sensor_msgs::msg::PointField::FLOAT32);
+                          }
                           modifier.resize(msg->width * msg->height);
 
                           sensor_msgs::PointCloud2Iterator<float> iter_x(cloud_color_msg, "x");
@@ -138,14 +199,41 @@ namespace color_point_cloud {
                           sensor_msgs::PointCloud2Iterator<uint8_t> iter_r(cloud_color_msg, "r");
                           sensor_msgs::PointCloud2Iterator<uint8_t> iter_g(cloud_color_msg, "g");
                           sensor_msgs::PointCloud2Iterator<uint8_t> iter_b(cloud_color_msg, "b");
-                          sensor_msgs::PointCloud2Iterator<uint16_t> iter_ring(cloud_color_msg, "ring");
-                          sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud_color_msg, "intensity");
 
-                          pc2_combiner::PointCloudConst cloud{*msg};
-                          for (size_t i = 0; i < cloud.getPointCount(); ++i) {
-                              pc2_combiner::Point point{cloud.getCurrentPoint()};
+                          sensor_msgs::PointCloud2ConstIterator<float> iter_x_in(*msg, "x");
+                          sensor_msgs::PointCloud2ConstIterator<float> iter_y_in(*msg, "y");
+                          sensor_msgs::PointCloud2ConstIterator<float> iter_z_in(*msg, "z");
+                          
+                          // Optional iterators for ring and intensity
+                          std::unique_ptr<sensor_msgs::PointCloud2Iterator<uint16_t>> iter_ring;
+                          std::unique_ptr<sensor_msgs::PointCloud2Iterator<float>> iter_intensity;
+                          std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<uint16_t>> iter_ring_in;
+                          std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> iter_intensity_in;
+                          
+                          if (has_ring && has_intensity) {
+                              try {
+                                  iter_ring = std::make_unique<sensor_msgs::PointCloud2Iterator<uint16_t>>(cloud_color_msg, "ring");
+                                  iter_ring_in = std::make_unique<sensor_msgs::PointCloud2ConstIterator<uint16_t>>(*msg, "ring");
+                              } catch (const std::exception& e) {
+                                  RCLCPP_WARN(this->get_logger(), "Failed to create ring iterator: %s. Skipping ring field.", e.what());
+                                  has_ring = false;
+                              }
+                              
+                              try {
+                                  iter_intensity = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(cloud_color_msg, "intensity");
+                                  iter_intensity_in = std::make_unique<sensor_msgs::PointCloud2ConstIterator<float>>(*msg, "intensity");
+                              } catch (const std::exception& e) {
+                                  RCLCPP_WARN(this->get_logger(), "Failed to create intensity iterator: %s. Skipping intensity field.", e.what());
+                                  has_intensity = false;
+                              }
+                          }
+                          
+                          for (size_t i = 0; i < msg->width * msg->height; ++i) {
+                              float px = iter_x_in[0];
+                              float py = iter_y_in[0];
+                              float pz = iter_z_in[0];
 
-                              Eigen::Vector4d point4d(point.x, point.y, point.z, 1.0);
+                              Eigen::Vector4d point4d(px, py, pz, 1.0);
 
                               Eigen::Vector3d point3d_transformed_camera =
                                       pair.second->get_lidar_to_camera_projection_matrix() * point4d;
@@ -157,25 +245,23 @@ namespace color_point_cloud {
                               double x = point2d_transformed_camera[0];
                               double y = point2d_transformed_camera[1];
 
-                              if (x < 0 || x > pair.second->get_image_width() || y < 0 ||
-                                  y > pair.second->get_image_height() ||
-                                  point3d_transformed_camera[2] < 0) {
 
-                                  iter_x[0] = point.x;
-                                  iter_y[0] = point.y;
-                                  iter_z[0] = point.z;
-                                  iter_ring[0] = point.ring;
-                                  iter_intensity[0] = point.intensity;
+                              iter_x[0] = px;
+                              iter_y[0] = py;
+                              iter_z[0] = pz;
+                              
+                              if (has_ring && iter_ring_in) {
+                                  (*iter_ring)[0] = (*iter_ring_in)[0];
+                              }
+                              if (has_intensity && iter_intensity_in) {
+                                  (*iter_intensity)[0] = (*iter_intensity_in)[0];
+                              }
 
-                              } else {
-                                  cv::Vec3d color = pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
-                                  cv::Scalar color_scalar(color[0], color[1], color[2]);
+                              if (x >= 0 && x < pair.second->get_image_width() && y >= 0 &&
+                                  y < pair.second->get_image_height() &&
+                                  point3d_transformed_camera[2] > 0) {
 
-                                  iter_x[0] = point.x;
-                                  iter_y[0] = point.y;
-                                  iter_z[0] = point.z;
-                                  iter_ring[0] = point.ring;
-                                  iter_intensity[0] = point.intensity;
+                                  cv::Vec3b color = pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
 
                                   if (pair.second->get_image_msg()->encoding == "rgb8") {
                                       iter_r[0] = color[0];
@@ -198,10 +284,19 @@ namespace color_point_cloud {
                               ++iter_r;
                               ++iter_g;
                               ++iter_b;
-                              ++iter_ring;
-                              ++iter_intensity;
-
-                              cloud.nextPoint();
+                              
+                              ++iter_x_in;
+                              ++iter_y_in;
+                              ++iter_z_in;
+                              
+                              if (has_ring && iter_ring && iter_ring_in) {
+                                  ++(*iter_ring);
+                                  ++(*iter_ring_in);
+                              }
+                              if (has_intensity && iter_intensity && iter_intensity_in) {
+                                  ++(*iter_intensity);
+                                  ++(*iter_intensity_in);
+                              }
                           }
 //                          cv::imshow(pair.first, pair.second->get_cv_image());
 //                          cv::waitKey(1);
