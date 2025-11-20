@@ -147,8 +147,9 @@ namespace color_point_cloud {
     void ColorPointCloud::point_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
 
         sensor_msgs::msg::PointCloud2 cloud_color_msg;
+        static bool coloring_started_logged = false;
         std::for_each(camera_type_stdmap_.begin(), camera_type_stdmap_.end(),
-                      [this, &cloud_color_msg, msg](std::pair<std::string, CameraTypePtr> pair) {
+                      [this, &cloud_color_msg, &coloring_started_logged, msg](std::pair<std::string, CameraTypePtr> pair) {
                           if (pair.second->get_image_msg() == nullptr) {
                               RCLCPP_WARN(this->get_logger(), "Camera %s: don't receive image", pair.first.c_str());
                               return;
@@ -157,15 +158,19 @@ namespace color_point_cloud {
                               RCLCPP_WARN(this->get_logger(), "Camera %s: don't receive camera_info", pair.first.c_str());
                               return;
                           }
-                        //   if (!pair.second->is_info_initialized()) {
-                        //       RCLCPP_WARN(this->get_logger(), "Camera %s: can't init camera utils", pair.first.c_str());
-                        //       return;
-                        //   }
+                          if (!pair.second->is_info_initialized()) {
+                              RCLCPP_WARN(this->get_logger(), "Camera %s: can't init camera utils", pair.first.c_str());
+                              return;
+                          }
                           if (!pair.second->is_transform_initialized()) {
                               RCLCPP_WARN(this->get_logger(), "Camera %s: can't get transform", pair.first.c_str());
                               return;
                           }
-                          RCLCPP_INFO(this->get_logger(), "AAAAA");
+                          
+                          if (!coloring_started_logged) {
+                              RCLCPP_INFO(this->get_logger(), "Point cloud coloring started");
+                              coloring_started_logged = true;
+                          }
 
                           pair.second->set_cv_image(pair.second->get_image_msg(), image_type_);
 
@@ -245,23 +250,22 @@ namespace color_point_cloud {
                               double x = point2d_transformed_camera[0];
                               double y = point2d_transformed_camera[1];
 
-
-                              iter_x[0] = px;
-                              iter_y[0] = py;
-                              iter_z[0] = pz;
-                              
-                              if (has_ring && iter_ring_in) {
-                                  (*iter_ring)[0] = (*iter_ring_in)[0];
-                              }
-                              if (has_intensity && iter_intensity_in) {
-                                  (*iter_intensity)[0] = (*iter_intensity_in)[0];
-                              }
-
                               if (x >= 0 && x < pair.second->get_image_width() && y >= 0 &&
                                   y < pair.second->get_image_height() &&
                                   point3d_transformed_camera[2] > 0) {
 
                                   cv::Vec3b color = pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
+
+                                  iter_x[0] = px;
+                                  iter_y[0] = py;
+                                  iter_z[0] = pz;
+                                  
+                                  if (has_ring && iter_ring_in) {
+                                      (*iter_ring)[0] = (*iter_ring_in)[0];
+                                  }
+                                  if (has_intensity && iter_intensity_in) {
+                                      (*iter_intensity)[0] = (*iter_intensity_in)[0];
+                                  }
 
                                   if (pair.second->get_image_msg()->encoding == "rgb8") {
                                       iter_r[0] = color[0];
@@ -276,15 +280,22 @@ namespace color_point_cloud {
                                       iter_g[0] = color[1];
                                       iter_b[0] = color[0];
                                   }
+
+                                  ++iter_x;
+                                  ++iter_y;
+                                  ++iter_z;
+                                  ++iter_r;
+                                  ++iter_g;
+                                  ++iter_b;
+                                  
+                                  if (has_ring && iter_ring) {
+                                      ++(*iter_ring);
+                                  }
+                                  if (has_intensity && iter_intensity) {
+                                      ++(*iter_intensity);
+                                  }
                               }
 
-                              ++iter_x;
-                              ++iter_y;
-                              ++iter_z;
-                              ++iter_r;
-                              ++iter_g;
-                              ++iter_b;
-                              
                               ++iter_x_in;
                               ++iter_y_in;
                               ++iter_z_in;
