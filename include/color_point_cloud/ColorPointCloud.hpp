@@ -35,6 +35,7 @@ namespace color_point_cloud {
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_publisher_;
 
         double timeout_sec_;
+        bool use_reliable_qos_;
 
         std::string point_cloud_topic_;
 

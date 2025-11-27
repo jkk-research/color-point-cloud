@@ -35,13 +35,25 @@ target_link_libraries(color_point_cloud
         ${EIGEN3_LIBRARIES}
 )
 
+add_executable(cutted_pointcloud
+        src/cutted_pointcloud.cpp)
+
+ament_target_dependencies(cutted_pointcloud
+        rclcpp
+        sensor_msgs
+)
+
+target_link_libraries(cutted_pointcloud
+        ${EIGEN3_LIBRARIES}
+)
+
 install(DIRECTORY
         launch
         config
         DESTINATION share/${PROJECT_NAME}/
 )
 
-install(TARGETS color_point_cloud
+install(TARGETS color_point_cloud cutted_pointcloud
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

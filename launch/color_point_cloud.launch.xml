@@ -1,6 +1,6 @@
 <launch>
-    <arg name="timeout_sec" default="0.1"/>
-    <arg name="point_cloud_topic" default="/luminar_pcl"/>
+    <arg name="timeout_sec" default="0.05"/>
+    <arg name="point_cloud_topic" default="/luminar_pcl_cutted"/>
     <arg name="point_cloud_frame_id" default="luminar_lidar_0"/>
     <arg name="camera_topics"
          default="[/zed/zed_node/left/]"/>
