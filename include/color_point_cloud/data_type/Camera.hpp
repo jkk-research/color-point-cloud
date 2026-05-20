@@ -10,6 +10,7 @@
 
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/image_encodings.hpp>
 
 #include <geometry_msgs/msg/transform_stamped.h>
 #include <geometry_msgs/msg/detail/transform_stamped__struct.hpp>
@@ -37,10 +38,10 @@ namespace color_point_cloud {
         }
 
         void set_cv_image(const sensor_msgs::msg::Image::ConstSharedPtr &msg, ImageType image_type) {
-            cv_bridge::CvImageConstPtr cv_ptr;
+            cv_bridge::CvImagePtr cv_ptr;
             if (image_type == ImageType::RAW) {
                 try {
-                    cv_ptr = cv_bridge::toCvShare(msg, get_image_msg()->encoding);
+                    cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
                 } catch (cv_bridge::Exception &e) {
 //                    RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
                     return;
@@ -49,7 +50,7 @@ namespace color_point_cloud {
                               get_distortion_matrix_cv());
             } else if (image_type == ImageType::RECTIFIED) {
                 try {
-                    cv_ptr = cv_bridge::toCvShare(msg, get_image_msg()->encoding);
+                    cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
                 } catch (cv_bridge::Exception &e) {
 //                    RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
                     return;

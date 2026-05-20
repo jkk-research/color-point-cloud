@@ -15,6 +15,7 @@ public:
         this->declare_parameter<double>("cut_angle_left_deg", 57.5);   // Cut from left side (negative angles)
         this->declare_parameter<double>("min_distance_x", 3.0);  // Minimum distance in X (forward) direction in meters
         this->declare_parameter<bool>("use_reliable_qos", true);  // true for rosbag, false for live sensor
+        this->declare_parameter<bool>("debug", false);
         
         // Get parameters
         input_topic_ = this->get_parameter("input_topic").as_string();
@@ -23,6 +24,7 @@ public:
         cut_angle_left_deg_ = this->get_parameter("cut_angle_left_deg").as_double();
         min_distance_x_ = this->get_parameter("min_distance_x").as_double();
         bool use_reliable = this->get_parameter("use_reliable_qos").as_bool();
+        debug_ = this->get_parameter("debug").as_bool();
         
         // Convert to radians
         // For forward-looking lidar (180° FOV): -90° (left) to +90° (right)
@@ -41,25 +43,105 @@ public:
                     min_distance_x_, min_distance_x_);
         
         // Configure QoS based on parameter
-        auto qos = use_reliable ? 
+        auto publisher_qos = use_reliable ? 
             rclcpp::QoS(1).reliable().durability_volatile().keep_last(1) : 
             rclcpp::SensorDataQoS().keep_last(1);
         
         RCLCPP_INFO(this->get_logger(), "Using %s QoS", use_reliable ? "RELIABLE" : "BEST_EFFORT");
         
         // Create subscriber and publisher
-        subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            input_topic_, qos,
-            std::bind(&CuttedPointCloud::pointcloud_callback, this, std::placeholders::_1));
+        create_or_update_subscription();
         
         publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            output_topic_, qos);
+            output_topic_, publisher_qos);
+
+        qos_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(1000),
+            std::bind(&CuttedPointCloud::create_or_update_subscription, this));
         
         RCLCPP_INFO(this->get_logger(), "Subscribed to: %s", input_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "Publishing to: %s", output_topic_.c_str());
     }
 
 private:
+    void create_or_update_subscription()
+    {
+        const auto desired_reliability = detect_subscription_reliability();
+
+        if (subscription_ != nullptr && desired_reliability == subscription_reliability_) {
+            return;
+        }
+
+        auto subscription_qos = desired_reliability == rclcpp::ReliabilityPolicy::Reliable ?
+            rclcpp::QoS(1).reliable().durability_volatile().keep_last(1) :
+            rclcpp::SensorDataQoS().keep_last(1);
+
+        subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            input_topic_, subscription_qos,
+            std::bind(&CuttedPointCloud::pointcloud_callback, this, std::placeholders::_1));
+        subscription_reliability_ = desired_reliability;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Input point cloud subscriber QoS set to %s for topic %s",
+            reliability_to_string(subscription_reliability_),
+            input_topic_.c_str());
+    }
+
+    rclcpp::ReliabilityPolicy detect_subscription_reliability()
+    {
+        const auto publishers_info = this->get_publishers_info_by_topic(input_topic_);
+
+        if (publishers_info.empty()) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 5000,
+                "No publishers discovered yet on %s, falling back to BEST_EFFORT subscriber QoS",
+                input_topic_.c_str());
+            return rclcpp::ReliabilityPolicy::BestEffort;
+        }
+
+        bool has_best_effort_publisher = false;
+        bool has_reliable_publisher = false;
+
+        for (const auto &publisher_info : publishers_info) {
+            const auto reliability = publisher_info.qos_profile().reliability();
+            if (reliability == rclcpp::ReliabilityPolicy::BestEffort) {
+                has_best_effort_publisher = true;
+            } else if (reliability == rclcpp::ReliabilityPolicy::Reliable) {
+                has_reliable_publisher = true;
+            }
+        }
+
+        if (has_best_effort_publisher) {
+            return rclcpp::ReliabilityPolicy::BestEffort;
+        }
+
+        if (has_reliable_publisher) {
+            return rclcpp::ReliabilityPolicy::Reliable;
+        }
+
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000,
+            "Could not determine publisher reliability on %s, using BEST_EFFORT subscriber QoS",
+            input_topic_.c_str());
+        return rclcpp::ReliabilityPolicy::BestEffort;
+    }
+
+    static const char *reliability_to_string(rclcpp::ReliabilityPolicy reliability_policy)
+    {
+        switch (reliability_policy) {
+            case rclcpp::ReliabilityPolicy::BestEffort:
+                return "BEST_EFFORT";
+            case rclcpp::ReliabilityPolicy::Reliable:
+                return "RELIABLE";
+            case rclcpp::ReliabilityPolicy::SystemDefault:
+                return "SYSTEM_DEFAULT";
+            case rclcpp::ReliabilityPolicy::Unknown:
+            default:
+                return "UNKNOWN";
+        }
+    }
+
     void pointcloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
     {
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -232,7 +314,7 @@ private:
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
         
         // Log statistics every 30 frames
-        if (frame_count_ % 30 == 0) {
+        if (debug_ && frame_count_ % 30 == 0) {
             double kept_percentage = (static_cast<double>(kept_points) / total_points) * 100.0;
             RCLCPP_INFO(this->get_logger(), 
                 "Frame %zu: Kept %zu/%zu points (%.1f%%), processing took %ld ms", 
@@ -242,6 +324,7 @@ private:
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
+    rclcpp::TimerBase::SharedPtr qos_timer_;
     
     std::string input_topic_;
     std::string output_topic_;
@@ -250,6 +333,8 @@ private:
     double min_angle_rad_;  // Minimum angle to keep (left boundary)
     double max_angle_rad_;  // Maximum angle to keep (right boundary)
     double min_distance_x_;  // Minimum distance in X (forward) direction - cut closer points
+    bool debug_ = false;
+    rclcpp::ReliabilityPolicy subscription_reliability_ = rclcpp::ReliabilityPolicy::Unknown;
     
     size_t frame_count_ = 0;
 };

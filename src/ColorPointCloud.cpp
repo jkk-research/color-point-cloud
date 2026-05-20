@@ -8,7 +8,8 @@ namespace color_point_cloud {
     ColorPointCloud::ColorPointCloud(const rclcpp::NodeOptions &options) : Node("color_point_cloud_node", options),
                                                                            transform_provider_ptr_(
                                                                                    std::make_shared<TransformProvider>(
-                                                                                           this->get_clock())) {
+                                               this->get_clock())),
+                                       point_cloud_subscription_reliability_(rclcpp::ReliabilityPolicy::Unknown) {
         RCLCPP_INFO(this->get_logger(), "ColorPointCloud node started");
 
         // Declare and get parameters
@@ -41,6 +42,9 @@ namespace color_point_cloud {
 
             this->declare_parameter<bool>("use_reliable_qos", true);  // true for rosbag, false for live sensor
             use_reliable_qos_ = this->get_parameter("use_reliable_qos").as_bool();
+
+            this->declare_parameter<bool>("debug", false);
+            debug_ = this->get_parameter("debug").as_bool();
 
             for (auto &camera_topic: camera_topics_) {
                 RCLCPP_INFO(this->get_logger(), "camera_topic: %s", camera_topic.c_str());
@@ -100,18 +104,14 @@ namespace color_point_cloud {
         }
 
         {
-            // Configure QoS based on parameter
-            auto qos = use_reliable_qos_ ? 
-                rclcpp::QoS(1).reliable().durability_volatile().keep_last(1) : 
+            auto publisher_qos = use_reliable_qos_ ?
+                rclcpp::QoS(1).reliable().durability_volatile().keep_last(1) :
                 rclcpp::SensorDataQoS().keep_last(1);
-            
-            // Use keep_last(1) to always process only the latest point cloud and avoid queuing
-            point_cloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                    point_cloud_topic_, qos,
-                    std::bind(&ColorPointCloud::point_cloud_callback, this, std::placeholders::_1));
+
+            create_or_update_point_cloud_subscription();
 
             point_cloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                    "/points_color", qos);
+                    "/points_color", publisher_qos);
         }
 
         // Set timer
@@ -125,6 +125,8 @@ namespace color_point_cloud {
     }
 
     void ColorPointCloud::timer_callback() {
+        create_or_update_point_cloud_subscription();
+
         //RCLCPP_INFO(this->get_logger(), "Timer callback triggered");
         for (const auto &pair: camera_type_stdmap_) {
             if (pair.second->get_image_msg() == nullptr || pair.second->get_camera_info() == nullptr) {
@@ -134,9 +136,11 @@ namespace color_point_cloud {
 
             if (!pair.second->is_info_initialized()) {
                 auto cam_info = pair.second->get_camera_info();
-                RCLCPP_INFO(this->get_logger(), "Camera info is setting: %s", pair.first.c_str());
-                RCLCPP_INFO(this->get_logger(), "Camera info - width: %d, height: %d, K[0]: %f, frame_id: %s", 
-                    cam_info->width, cam_info->height, cam_info->k[0], cam_info->header.frame_id.c_str());
+                if (debug_) {
+                    RCLCPP_INFO(this->get_logger(), "Camera info is setting: %s", pair.first.c_str());
+                    RCLCPP_INFO(this->get_logger(), "Camera info - width: %d, height: %d, K[0]: %f, frame_id: %s",
+                        cam_info->width, cam_info->height, cam_info->k[0], cam_info->header.frame_id.c_str());
+                }
                 pair.second->set_camera_utils(cam_info);
                 if (!pair.second->is_info_initialized()) {
                     RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera utils for: %s", pair.first.c_str());
@@ -152,6 +156,81 @@ namespace color_point_cloud {
                 pair.second->set_lidar_to_camera_matrix(transform.value());
                 pair.second->set_lidar_to_camera_projection_matrix();
             }
+        }
+    }
+
+    void ColorPointCloud::create_or_update_point_cloud_subscription() {
+        const auto desired_reliability = detect_point_cloud_subscription_reliability();
+
+        if (point_cloud_subscriber_ != nullptr && desired_reliability == point_cloud_subscription_reliability_) {
+            return;
+        }
+
+        auto subscription_qos = desired_reliability == rclcpp::ReliabilityPolicy::Reliable ?
+            rclcpp::QoS(1).reliable().durability_volatile().keep_last(1) :
+            rclcpp::SensorDataQoS().keep_last(1);
+
+        point_cloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                point_cloud_topic_, subscription_qos,
+                std::bind(&ColorPointCloud::point_cloud_callback, this, std::placeholders::_1));
+        point_cloud_subscription_reliability_ = desired_reliability;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Point cloud subscriber QoS set to %s for topic %s",
+            reliability_to_string(point_cloud_subscription_reliability_),
+            point_cloud_topic_.c_str());
+    }
+
+    rclcpp::ReliabilityPolicy ColorPointCloud::detect_point_cloud_subscription_reliability() {
+        const auto publishers_info = this->get_publishers_info_by_topic(point_cloud_topic_);
+
+        if (publishers_info.empty()) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 5000,
+                "No publishers discovered yet on %s, falling back to BEST_EFFORT subscriber QoS",
+                point_cloud_topic_.c_str());
+            return rclcpp::ReliabilityPolicy::BestEffort;
+        }
+
+        bool has_best_effort_publisher = false;
+        bool has_reliable_publisher = false;
+
+        for (const auto &publisher_info : publishers_info) {
+            const auto reliability = publisher_info.qos_profile().reliability();
+            if (reliability == rclcpp::ReliabilityPolicy::BestEffort) {
+                has_best_effort_publisher = true;
+            } else if (reliability == rclcpp::ReliabilityPolicy::Reliable) {
+                has_reliable_publisher = true;
+            }
+        }
+
+        if (has_best_effort_publisher) {
+            return rclcpp::ReliabilityPolicy::BestEffort;
+        }
+
+        if (has_reliable_publisher) {
+            return rclcpp::ReliabilityPolicy::Reliable;
+        }
+
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000,
+            "Could not determine publisher reliability on %s, using BEST_EFFORT subscriber QoS",
+            point_cloud_topic_.c_str());
+        return rclcpp::ReliabilityPolicy::BestEffort;
+    }
+
+    const char *ColorPointCloud::reliability_to_string(rclcpp::ReliabilityPolicy reliability_policy) {
+        switch (reliability_policy) {
+            case rclcpp::ReliabilityPolicy::BestEffort:
+                return "BEST_EFFORT";
+            case rclcpp::ReliabilityPolicy::Reliable:
+                return "RELIABLE";
+            case rclcpp::ReliabilityPolicy::SystemDefault:
+                return "SYSTEM_DEFAULT";
+            case rclcpp::ReliabilityPolicy::Unknown:
+            default:
+                return "UNKNOWN";
         }
     }
 
@@ -200,7 +279,7 @@ namespace color_point_cloud {
         }
 
         static bool coloring_started_logged = false;
-        if (!coloring_started_logged) {
+        if (debug_ && !coloring_started_logged) {
             RCLCPP_INFO(this->get_logger(), "Point cloud coloring started with %zu cameras", ready_cameras.size());
             coloring_started_logged = true;
         }
@@ -286,6 +365,9 @@ namespace color_point_cloud {
                     point3d_transformed_camera[2] > 0) {
 
                     cv::Vec3b color = camera_pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
+                    const uint8_t output_r = color[2];
+                    const uint8_t output_g = color[1];
+                    const uint8_t output_b = color[0];
 
                     // Only add point if it was successfully colored
                     iter_x[0] = px;
@@ -299,19 +381,18 @@ namespace color_point_cloud {
                         (*iter_intensity)[0] = (*iter_intensity_in)[0];
                     }
 
-                    if (camera_pair.second->get_image_msg()->encoding == "rgb8") {
-                        iter_r[0] = color[0];
-                        iter_g[0] = color[1];
-                        iter_b[0] = color[2];
-                    } else if (camera_pair.second->get_image_msg()->encoding == "bgr8") {
-                        iter_r[0] = color[2];
-                        iter_g[0] = color[1];
-                        iter_b[0] = color[0];
-                    } else {
-                        iter_r[0] = color[2];
-                        iter_g[0] = color[1];
-                        iter_b[0] = color[0];
-                    }
+                    iter_r[0] = output_r;
+                    iter_g[0] = output_g;
+                    iter_b[0] = output_b;
+
+                    RCLCPP_DEBUG(
+                        this->get_logger(),
+                        "Forwarding point RGB from camera %s: R=%u G=%u B=%u (input encoding: %s)",
+                        camera_pair.first.c_str(),
+                        static_cast<unsigned int>(output_r),
+                        static_cast<unsigned int>(output_g),
+                        static_cast<unsigned int>(output_b),
+                        camera_pair.second->get_image_msg()->encoding.c_str());
 
                     ++iter_x;
                     ++iter_y;
@@ -350,12 +431,19 @@ namespace color_point_cloud {
         cloud_color_msg.height = 1;
         cloud_color_msg.width = static_cast<uint32_t>(colored_points);
         modifier.resize(colored_points);
-        point_cloud_publisher_->publish(cloud_color_msg);
+        if (colored_points > 0) {
+            point_cloud_publisher_->publish(cloud_color_msg);
+        } else {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "No colored points found, not publishing empty point cloud");
+        }
         
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        RCLCPP_INFO(this->get_logger(), "Point cloud processing took %ld ms, colored %zu/%zu points", 
-            duration.count(), colored_points, msg->width * msg->height);
+        if (debug_) {
+            RCLCPP_INFO(this->get_logger(), "Point cloud processing took %ld ms, colored %zu/%zu points",
+                duration.count(), colored_points, static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height));
+        }
     }
 
 
