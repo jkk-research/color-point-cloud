@@ -53,6 +53,7 @@ namespace color_point_cloud {
         bool use_compressed_image_;
 
         std::map<std::string, CameraTypePtr> camera_type_stdmap_;
+        std::map<std::string, bool> missing_transform_warned_;
 
         std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subscribers_;
         std::vector<rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr> compressed_image_subscribers_;

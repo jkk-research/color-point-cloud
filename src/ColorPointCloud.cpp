@@ -61,6 +61,7 @@ namespace color_point_cloud {
 
                 CameraTypePtr camera_type_ptr = std::make_shared<CameraType>(image_topic, camera_info_topic);
                 camera_type_stdmap_[camera_topic] = camera_type_ptr;
+                missing_transform_warned_[camera_topic] = false;
 
                 if (use_compressed_image_) {
                     this->compressed_image_subscribers_.push_back(
@@ -148,10 +149,25 @@ namespace color_point_cloud {
             }
 
             if (!pair.second->is_transform_initialized() && pair.second->is_info_initialized()) {
+                const auto camera_frame_id = pair.second->get_camera_frame_id();
                 std::optional<geometry_msgs::msg::TransformStamped> transform = (*transform_provider_ptr_)(
-                        pair.second->get_camera_frame_id(), point_cloud_frame_id_);
+                        camera_frame_id, point_cloud_frame_id_);
                 if (!transform.has_value()) {
+                    if (!missing_transform_warned_[pair.first]) {
+                        RCLCPP_WARN(
+                            this->get_logger(),
+                            "Missing transform from point cloud frame '%s' to camera frame '%s' for topic %s",
+                            point_cloud_frame_id_.c_str(), camera_frame_id.c_str(), pair.first.c_str());
+                        missing_transform_warned_[pair.first] = true;
+                    }
                     continue;
+                }
+                if (missing_transform_warned_[pair.first]) {
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "Transform became available from point cloud frame '%s' to camera frame '%s' for topic %s",
+                        point_cloud_frame_id_.c_str(), camera_frame_id.c_str(), pair.first.c_str());
+                    missing_transform_warned_[pair.first] = false;
                 }
                 pair.second->set_lidar_to_camera_matrix(transform.value());
                 pair.second->set_lidar_to_camera_projection_matrix();
