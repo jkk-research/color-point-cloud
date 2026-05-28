@@ -14,6 +14,7 @@ public:
         this->declare_parameter<double>("cut_angle_right_deg", 57.5);  // Cut from right side (positive angles)
         this->declare_parameter<double>("cut_angle_left_deg", 57.5);   // Cut from left side (negative angles)
         this->declare_parameter<double>("min_distance_x", 3.0);  // Minimum distance in X (forward) direction in meters
+        this->declare_parameter<bool>("keep_front_half", true);  // true keeps x >= min_distance_x, false keeps x <= -min_distance_x
         this->declare_parameter<bool>("use_reliable_qos", true);  // true for rosbag, false for live sensor
         this->declare_parameter<bool>("debug", false);
         
@@ -23,6 +24,7 @@ public:
         cut_angle_right_deg_ = this->get_parameter("cut_angle_right_deg").as_double();
         cut_angle_left_deg_ = this->get_parameter("cut_angle_left_deg").as_double();
         min_distance_x_ = this->get_parameter("min_distance_x").as_double();
+        keep_front_half_ = this->get_parameter("keep_front_half").as_bool();
         bool use_reliable = this->get_parameter("use_reliable_qos").as_bool();
         debug_ = this->get_parameter("debug").as_bool();
         
@@ -39,8 +41,9 @@ public:
                     cut_angle_right_deg_, cut_angle_left_deg_);
         RCLCPP_INFO(this->get_logger(), "Keeping center %.1f° (from %.1f° to %.1f°)", 
                     kept_angle, min_angle_rad_ * 180.0 / M_PI, max_angle_rad_ * 180.0 / M_PI);
-        RCLCPP_INFO(this->get_logger(), "Min distance in X (forward): %.2f m (cutting 0-%.2f m)", 
-                    min_distance_x_, min_distance_x_);
+        RCLCPP_INFO(this->get_logger(), "Keeping %s half of the point cloud", keep_front_half_ ? "front" : "rear");
+        RCLCPP_INFO(this->get_logger(), "Min distance in X (%s): %.2f m",
+                keep_front_half_ ? "forward" : "backward", min_distance_x_);
         
         // Configure QoS based on parameter
         auto publisher_qos = use_reliable ? 
@@ -252,11 +255,13 @@ private:
             // atan2(y, x) gives angle from positive x-axis in range [-pi, pi]
             // Positive angles = right side, negative angles = left side
             double angle = std::atan2(y, x);
+            double selection_angle = keep_front_half_ ? angle : std::atan2(y, -x);
             
             // Keep points within the specified angle range and distance
             // Cut cut_angle_left from left (-90°) and cut_angle_right from right (+90°)
             // Also cut points closer than min_distance_x in forward direction
-            if (angle >= min_angle_rad_ && angle <= max_angle_rad_ && x >= min_distance_x_) {
+            const bool passes_half_selection = keep_front_half_ ? x >= min_distance_x_ : x <= -min_distance_x_;
+            if (selection_angle >= min_angle_rad_ && selection_angle <= max_angle_rad_ && passes_half_selection) {
                 iter_x_out[0] = x;
                 iter_y_out[0] = y;
                 iter_z_out[0] = z;
@@ -333,6 +338,7 @@ private:
     double min_angle_rad_;  // Minimum angle to keep (left boundary)
     double max_angle_rad_;  // Maximum angle to keep (right boundary)
     double min_distance_x_;  // Minimum distance in X (forward) direction - cut closer points
+    bool keep_front_half_ = true;
     bool debug_ = false;
     rclcpp::ReliabilityPolicy subscription_reliability_ = rclcpp::ReliabilityPolicy::Unknown;
     

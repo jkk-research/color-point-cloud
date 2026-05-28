@@ -1,13 +1,13 @@
 <launch>
     <arg name="timeout_sec" default="0.05"/>
-    <arg name="cutted_input_topic" default="/luminar_pcl"/>
+    <arg name="cutted_input_topic" default="/lexus3/os_center/points"/>
     <arg name="cutted_output_topic" default="/cutted_pointcloud"/>
     <arg name="cut_angle_right_deg" default="0.0"/>
     <arg name="cut_angle_left_deg" default="0.0"/>
     <arg name="min_distance_x" default="0.0"/>
-    <arg name="keep_front_half" default="true"/>
+    <arg name="keep_front_half" default="false"/>
     <arg name="use_reliable_qos" default="true"/>
-    <arg name="point_cloud_frame_id" default="luminar_lidar_0"/>
+    <arg name="point_cloud_frame_id" default="lexus3/os_center"/>
     <arg name="camera_topics"
          default="[/lexus3/camera/camera0/,/lexus3/camera/camera1/]"/>
     <arg name="image_type" default="1" description="0:RAW, 1:RECTIFIED"/>

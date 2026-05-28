@@ -9,7 +9,8 @@ namespace color_point_cloud {
                                                                            transform_provider_ptr_(
                                                                                    std::make_shared<TransformProvider>(
                                                this->get_clock())),
-                                       point_cloud_subscription_reliability_(rclcpp::ReliabilityPolicy::Unknown) {
+                           point_cloud_subscription_reliability_(rclcpp::ReliabilityPolicy::Unknown),
+                           processed_point_cloud_frames_(0) {
         RCLCPP_INFO(this->get_logger(), "ColorPointCloud node started");
 
         // Declare and get parameters
@@ -46,6 +47,32 @@ namespace color_point_cloud {
             this->declare_parameter<bool>("debug", false);
             debug_ = this->get_parameter("debug").as_bool();
 
+            this->declare_parameter<bool>("debug_camera_overlap_red", false);
+            debug_camera_overlap_red_ = this->get_parameter("debug_camera_overlap_red").as_bool();
+
+            this->declare_parameter<std::vector<double>>("camera_time_offsets_ms", std::vector<double>(camera_topics_.size(), 0.0));
+            camera_time_offsets_ms_ = this->get_parameter("camera_time_offsets_ms").as_double_array();
+
+            this->declare_parameter<bool>("use_approximate_sync", true);
+            use_approximate_sync_ = this->get_parameter("use_approximate_sync").as_bool();
+
+            this->declare_parameter<double>("approximate_sync_slop_ms", 100.0);
+            approximate_sync_slop_ms_ = this->get_parameter("approximate_sync_slop_ms").as_double();
+
+            this->declare_parameter<int>("approximate_sync_queue_size", 20);
+            approximate_sync_queue_size_ = this->get_parameter("approximate_sync_queue_size").as_int();
+
+            approximate_sync_active_ = false;
+
+            if (camera_time_offsets_ms_.size() != camera_topics_.size()) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "camera_time_offsets_ms size (%zu) does not match camera_topics size (%zu); resizing and filling missing offsets with 0.0 ms",
+                    camera_time_offsets_ms_.size(),
+                    camera_topics_.size());
+                camera_time_offsets_ms_.resize(camera_topics_.size(), 0.0);
+            }
+
             for (auto &camera_topic: camera_topics_) {
                 RCLCPP_INFO(this->get_logger(), "camera_topic: %s", camera_topic.c_str());
             }
@@ -55,13 +82,19 @@ namespace color_point_cloud {
 
         // Create camera object, create subscriber to image and camera_info
         {
-            for (const auto &camera_topic: camera_topics_) {
+            for (size_t camera_index = 0; camera_index < camera_topics_.size(); ++camera_index) {
+                const auto &camera_topic = camera_topics_[camera_index];
                 std::string image_topic = camera_topic + image_topic_last_name_;
                 std::string camera_info_topic = camera_topic + camera_info_topic_last_name_;
 
                 CameraTypePtr camera_type_ptr = std::make_shared<CameraType>(image_topic, camera_info_topic);
                 camera_type_stdmap_[camera_topic] = camera_type_ptr;
                 missing_transform_warned_[camera_topic] = false;
+                camera_state_log_[camera_topic] = "created";
+                camera_time_offsets_ns_[camera_topic] = static_cast<int64_t>(camera_time_offsets_ms_[camera_index] * 1e6);
+                if (camera_index < camera_image_sync_filters_.size()) {
+                    camera_sync_indices_[camera_topic] = camera_index;
+                }
 
                 if (use_compressed_image_) {
                     this->compressed_image_subscribers_.push_back(
@@ -92,6 +125,12 @@ namespace color_point_cloud {
                             [this, image_topic, camera_topic](const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
                                 // RCLCPP_INFO(this->get_logger(), "Received image on topic %s", camera_topic.c_str());
                                 camera_type_stdmap_[camera_topic]->set_image_msg(msg);
+                                if (approximate_sync_active_) {
+                                    const auto sync_index_it = camera_sync_indices_.find(camera_topic);
+                                    if (sync_index_it != camera_sync_indices_.end()) {
+                                        camera_image_sync_filters_[sync_index_it->second].add(msg, camera_time_offsets_ns_[camera_topic]);
+                                    }
+                                }
                             }));
                 }
 
@@ -102,6 +141,8 @@ namespace color_point_cloud {
                             camera_type_stdmap_[camera_topic]->set_camera_info(msg);
                         }));
             }
+
+            initialize_approximate_sync();
         }
 
         {
@@ -123,6 +164,50 @@ namespace color_point_cloud {
                                              std::bind(&ColorPointCloud::timer_callback, this));
         }
 
+    }
+
+    void ColorPointCloud::initialize_approximate_sync() {
+        approximate_sync_active_ = use_approximate_sync_ && !use_compressed_image_ && camera_topics_.size() == 2;
+
+        if (!approximate_sync_active_) {
+            if (use_approximate_sync_) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "ApproximateTime sync requested but disabled because it currently requires exactly 2 raw image topics; camera count=%zu, use_compressed_image=%s",
+                    camera_topics_.size(),
+                    use_compressed_image_ ? "true" : "false");
+            }
+            return;
+        }
+
+        approximate_synchronizer_ = std::make_unique<message_filters::Synchronizer<ApproximateSyncPolicy>>(
+            ApproximateSyncPolicy(approximate_sync_queue_size_),
+            point_cloud_sync_filter_,
+            camera_image_sync_filters_[0],
+            camera_image_sync_filters_[1]);
+        approximate_synchronizer_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(approximate_sync_slop_ms_ / 1000.0));
+        approximate_synchronizer_->registerCallback(
+            std::bind(
+                &ColorPointCloud::approximate_sync_callback,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2,
+                std::placeholders::_3));
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "ApproximateTime sync enabled for %s and %s with slop %.3f ms and queue size %d",
+            camera_topics_[0].c_str(),
+            camera_topics_[1].c_str(),
+            approximate_sync_slop_ms_,
+            approximate_sync_queue_size_);
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Configured camera time offsets: %s=%.3f ms, %s=%.3f ms",
+            camera_topics_[0].c_str(),
+            camera_time_offsets_ms_[0],
+            camera_topics_[1].c_str(),
+            camera_time_offsets_ms_[1]);
     }
 
     void ColorPointCloud::timer_callback() {
@@ -188,7 +273,7 @@ namespace color_point_cloud {
 
         point_cloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
                 point_cloud_topic_, subscription_qos,
-                std::bind(&ColorPointCloud::point_cloud_callback, this, std::placeholders::_1));
+            std::bind(&ColorPointCloud::point_cloud_input_callback, this, std::placeholders::_1));
         point_cloud_subscription_reliability_ = desired_reliability;
 
         RCLCPP_INFO(
@@ -196,6 +281,51 @@ namespace color_point_cloud {
             "Point cloud subscriber QoS set to %s for topic %s",
             reliability_to_string(point_cloud_subscription_reliability_),
             point_cloud_topic_.c_str());
+    }
+
+    void ColorPointCloud::point_cloud_input_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
+        if (approximate_sync_active_) {
+            point_cloud_sync_filter_.add(msg);
+            return;
+        }
+
+        point_cloud_callback(msg);
+    }
+
+    void ColorPointCloud::approximate_sync_callback(
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr &point_cloud_msg,
+        const sensor_msgs::msg::Image::ConstSharedPtr &camera0_msg,
+        const sensor_msgs::msg::Image::ConstSharedPtr &camera1_msg) {
+        camera_type_stdmap_[camera_topics_[0]]->set_image_msg(camera0_msg);
+        camera_type_stdmap_[camera_topics_[1]]->set_image_msg(camera1_msg);
+
+        if (debug_) {
+            const rclcpp::Time point_cloud_stamp(point_cloud_msg->header.stamp);
+            const double delta0_ms = static_cast<double>(rclcpp::Time(camera0_msg->header.stamp).nanoseconds() - point_cloud_stamp.nanoseconds()) / 1e6;
+            const double delta1_ms = static_cast<double>(rclcpp::Time(camera1_msg->header.stamp).nanoseconds() - point_cloud_stamp.nanoseconds()) / 1e6;
+            RCLCPP_INFO(
+                this->get_logger(),
+                "ApproximateTime match accepted: %s delta=%.3f ms, %s delta=%.3f ms",
+                camera_topics_[0].c_str(),
+                delta0_ms,
+                camera_topics_[1].c_str(),
+                delta1_ms);
+        }
+
+        point_cloud_callback(point_cloud_msg);
+    }
+
+    void ColorPointCloud::log_camera_state(const std::string &camera_topic, const std::string &state) {
+        if (!debug_) {
+            return;
+        }
+
+        if (camera_state_log_[camera_topic] == state) {
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Camera %s state: %s", camera_topic.c_str(), state.c_str());
+        camera_state_log_[camera_topic] = state;
     }
 
     rclcpp::ReliabilityPolicy ColorPointCloud::detect_point_cloud_subscription_reliability() {
@@ -252,6 +382,7 @@ namespace color_point_cloud {
 
     void ColorPointCloud::point_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
         auto start_time = std::chrono::high_resolution_clock::now();
+        processed_point_cloud_frames_++;
 
         // Check if input has ring and intensity fields
         bool has_ring = false;
@@ -265,25 +396,30 @@ namespace color_point_cloud {
         std::vector<std::pair<std::string, CameraTypePtr>> ready_cameras;
         for (const auto &pair: camera_type_stdmap_) {
             if (pair.second->get_image_msg() == nullptr) {
+                log_camera_state(pair.first, "waiting_image");
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
                     "Camera %s: don't receive image", pair.first.c_str());
                 continue;
             }
             if (pair.second->get_camera_info() == nullptr) {
+                log_camera_state(pair.first, "waiting_camera_info");
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Camera %s: don't receive camera_info", pair.first.c_str());
                 continue;
             }
             if (!pair.second->is_info_initialized()) {
+                log_camera_state(pair.first, "waiting_camera_init");
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Camera %s: can't init camera utils", pair.first.c_str());
                 continue;
             }
             if (!pair.second->is_transform_initialized()) {
+                log_camera_state(pair.first, "waiting_transform");
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Camera %s: can't get transform", pair.first.c_str());
                 continue;
             }
+            log_camera_state(pair.first, "ready");
             pair.second->set_cv_image(pair.second->get_image_msg(), image_type_);
             ready_cameras.push_back(pair);
         }
@@ -298,6 +434,42 @@ namespace color_point_cloud {
         if (debug_ && !coloring_started_logged) {
             RCLCPP_INFO(this->get_logger(), "Point cloud coloring started with %zu cameras", ready_cameras.size());
             coloring_started_logged = true;
+        }
+
+        if (debug_ && processed_point_cloud_frames_ % 30 == 0) {
+            const rclcpp::Time point_cloud_stamp(msg->header.stamp);
+            int64_t min_camera_stamp_ns = 0;
+            int64_t max_camera_stamp_ns = 0;
+            bool first_camera_stamp = true;
+
+            for (const auto &camera_pair : ready_cameras) {
+                const rclcpp::Time image_stamp(camera_pair.second->get_image_msg()->header.stamp);
+                const int64_t image_stamp_ns = image_stamp.nanoseconds();
+                const double delta_ms = static_cast<double>(image_stamp_ns - point_cloud_stamp.nanoseconds()) / 1e6;
+
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "Timestamp delta for %s relative to point cloud: %.3f ms",
+                    camera_pair.first.c_str(),
+                    delta_ms);
+
+                if (first_camera_stamp) {
+                    min_camera_stamp_ns = image_stamp_ns;
+                    max_camera_stamp_ns = image_stamp_ns;
+                    first_camera_stamp = false;
+                } else {
+                    min_camera_stamp_ns = std::min(min_camera_stamp_ns, image_stamp_ns);
+                    max_camera_stamp_ns = std::max(max_camera_stamp_ns, image_stamp_ns);
+                }
+            }
+
+            if (!first_camera_stamp && ready_cameras.size() > 1) {
+                const double camera_skew_ms = static_cast<double>(max_camera_stamp_ns - min_camera_stamp_ns) / 1e6;
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "Camera-to-camera timestamp skew across ready cameras: %.3f ms",
+                    camera_skew_ms);
+            }
         }
 
         // Create output point cloud structure
@@ -363,8 +535,10 @@ namespace color_point_cloud {
 
             Eigen::Vector4d point4d(px, py, pz, 1.0);
 
-            // Try to color the point from any camera
-            bool point_colored = false;
+            const std::pair<std::string, CameraTypePtr> *selected_camera = nullptr;
+            cv::Vec3b selected_color;
+            size_t contributing_cameras = 0;
+
             for (const auto &camera_pair : ready_cameras) {
                 Eigen::Vector3d point3d_transformed_camera =
                         camera_pair.second->get_lidar_to_camera_projection_matrix() * point4d;
@@ -379,55 +553,68 @@ namespace color_point_cloud {
                 if (x >= 0 && x < camera_pair.second->get_image_width() && y >= 0 &&
                     y < camera_pair.second->get_image_height() &&
                     point3d_transformed_camera[2] > 0) {
+                    contributing_cameras++;
 
-                    cv::Vec3b color = camera_pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
-                    const uint8_t output_r = color[2];
-                    const uint8_t output_g = color[1];
-                    const uint8_t output_b = color[0];
-
-                    // Only add point if it was successfully colored
-                    iter_x[0] = px;
-                    iter_y[0] = py;
-                    iter_z[0] = pz;
-                    
-                    if (has_ring && iter_ring_in && iter_ring) {
-                        (*iter_ring)[0] = (*iter_ring_in)[0];
+                    if (selected_camera == nullptr) {
+                        selected_camera = &camera_pair;
+                        selected_color = camera_pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
                     }
-                    if (has_intensity && iter_intensity_in && iter_intensity) {
-                        (*iter_intensity)[0] = (*iter_intensity_in)[0];
-                    }
-
-                    iter_r[0] = output_r;
-                    iter_g[0] = output_g;
-                    iter_b[0] = output_b;
 
                     RCLCPP_DEBUG(
                         this->get_logger(),
-                        "Forwarding point RGB from camera %s: R=%u G=%u B=%u (input encoding: %s)",
+                        "Camera %s contributes RGB: R=%u G=%u B=%u",
                         camera_pair.first.c_str(),
-                        static_cast<unsigned int>(output_r),
-                        static_cast<unsigned int>(output_g),
-                        static_cast<unsigned int>(output_b),
-                        camera_pair.second->get_image_msg()->encoding.c_str());
-
-                    ++iter_x;
-                    ++iter_y;
-                    ++iter_z;
-                    ++iter_r;
-                    ++iter_g;
-                    ++iter_b;
-                    
-                    if (has_ring && iter_ring) {
-                        ++(*iter_ring);
-                    }
-                    if (has_intensity && iter_intensity) {
-                        ++(*iter_intensity);
-                    }
-
-                    point_colored = true;
-                    colored_points++;
-                    break; // Point colored, move to next point
+                        static_cast<unsigned int>(selected_camera == &camera_pair ? selected_color[2] : camera_pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y))[2]),
+                        static_cast<unsigned int>(selected_camera == &camera_pair ? selected_color[1] : camera_pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y))[1]),
+                        static_cast<unsigned int>(selected_camera == &camera_pair ? selected_color[0] : camera_pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y))[0]));
                 }
+            }
+
+            if (selected_camera != nullptr) {
+                const bool is_overlap_point = debug_camera_overlap_red_ && contributing_cameras > 1;
+                const uint8_t output_r = is_overlap_point ? 255 : selected_color[2];
+                const uint8_t output_g = is_overlap_point ? 0 : selected_color[1];
+                const uint8_t output_b = is_overlap_point ? 0 : selected_color[0];
+
+                iter_x[0] = px;
+                iter_y[0] = py;
+                iter_z[0] = pz;
+
+                if (has_ring && iter_ring_in && iter_ring) {
+                    (*iter_ring)[0] = (*iter_ring_in)[0];
+                }
+                if (has_intensity && iter_intensity_in && iter_intensity) {
+                    (*iter_intensity)[0] = (*iter_intensity_in)[0];
+                }
+
+                iter_r[0] = output_r;
+                iter_g[0] = output_g;
+                iter_b[0] = output_b;
+
+                RCLCPP_DEBUG(
+                    this->get_logger(),
+                    "Forwarding %s point RGB from %zu camera(s): R=%u G=%u B=%u",
+                    is_overlap_point ? "overlap" : "single-camera",
+                    contributing_cameras,
+                    static_cast<unsigned int>(output_r),
+                    static_cast<unsigned int>(output_g),
+                    static_cast<unsigned int>(output_b));
+
+                ++iter_x;
+                ++iter_y;
+                ++iter_z;
+                ++iter_r;
+                ++iter_g;
+                ++iter_b;
+
+                if (has_ring && iter_ring) {
+                    ++(*iter_ring);
+                }
+                if (has_intensity && iter_intensity) {
+                    ++(*iter_intensity);
+                }
+
+                colored_points++;
             }
 
             // Always advance input iterators
